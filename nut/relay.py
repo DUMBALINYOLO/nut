@@ -3,6 +3,7 @@ import argparse
 import logging
 import select
 import socket
+import re
 from threading import Event, Thread
 
 
@@ -87,12 +88,19 @@ class UdpRelay(Thread):
                 .format(src_host))
             return
 
+        self._routeMessage( msg, src_name, src_host, src_port,
+                                 dst_name, dst_host, self.port )
+                            
+    def _routeMessage( self, msg, src_name, src_host, src_port,
+                                  dst_name, dst_host, dst_port ):
         self._logger.debug(
-            'Message received from host {:} ({!s}), routing to host {:} '
+            'Message received from host {:} ({!s}:{!s}), routing to host {:} '
             '({!s}:{!s})'
-            .format(src_name, src_host, dst_name, dst_host, self.port))
+            .format(
+                src_name, src_host, src_port,
+                dst_name, dst_host, dst_port))
 
-        self.socket.sendto(msg, (dst_host, self.port))
+        self.socket.sendto(msg, (dst_host, dst_port))
 
 
 class TcpRelay(Thread):
@@ -172,6 +180,17 @@ class TcpRelay(Thread):
                 'this possible?! Ignoring.')
             return False
 
+        if not msg:
+            self._logger.info(
+                'Connection to host {:} closed'.format(src_name))
+            return True
+
+        self._routeMessage( msg, src_name, src_host, src_port,
+                                 dst_name, dst_host, dst_port )
+        return False
+
+    def _routeMessage( self, msg, src_name, src_host, src_port,
+                                  dst_name, dst_host, dst_port ):
         self._logger.debug(
             'Message received from host {:} ({!s}:{!s}), routing to host {:} '
             '({!s}:{!s})'
@@ -179,14 +198,7 @@ class TcpRelay(Thread):
                 src_name, src_host, src_port,
                 dst_name, dst_host, dst_port))
 
-        if not msg:
-            self._logger.info(
-                'Connection to host {:} closed'.format(src_name))
-            return True
-
         dst_socket.send(msg)
-
-        return False
 
 
 class TcpRelayServer(Thread):
@@ -196,7 +208,8 @@ class TcpRelayServer(Thread):
             host_a, host_b, port,
             max_message_size=16384,
             timeout=1.0,
-            backlog=5):
+            backlog=5,
+            relay=TcpRelay):
         super(TcpRelayServer, self).__init__()
 
         self.host_a = host_a
@@ -205,6 +218,7 @@ class TcpRelayServer(Thread):
         self.max_message_size = max_message_size
         self.timeout = timeout
         self.backlog = backlog
+        self.relay = relay
 
         self._logger = logging.getLogger(
             'relay.TcpRelayServer({host_a} <-> {host_b}, {port})'
@@ -311,7 +325,7 @@ class TcpRelayServer(Thread):
             'Connection to ({!s}, {!s}) successful'
             .format(dst_host, self.port))
 
-        relay = TcpRelay(
+        relay = self.relay(
             src_socket, (src_host, src_port),
             dst_socket, (dst_host, self.port),
             self.max_message_size)
@@ -369,7 +383,59 @@ def main():
         default=5,
         help='Sets the backlog size for TCP connections (default=5)')
 
+    def substitution( option ):
+        """Accepts substitution patterns bracketed like sed, eg.
+
+            -s/pattern/replacement/
+            -s:pattern:replacement:
+
+        using a character not contained in either pattern nor replacment to bracket 
+        """
+        assert option and option[0] == option[-1], \
+            "substitution %r must be bound by the same character; in this case: %r" % (
+                option, option[0] )
+        patsub = tuple( option[1:-1].split( option[0] ))
+        assert len( patsub ) == 2, \
+            "substitution %r must contain exactly one %r within the bracketing %r's" % (
+                option, option[0], option[0] )
+        return patsub
+
+    parser.add_argument(
+        '--substitute',
+        '-s',
+        type=substitution,
+        action='append',
+        default=[],
+        help='Substitute every match of first Regular Expression with the second value' )
+        
     args = parser.parse_args()
+
+    class RelaySubstitutions( object ):
+        """Capture and perform any --sub /pat/sub/ substitutions, if specified.  Add to
+        {Tcp,Udp}Relay class to perform any configured substitutions, in order, before messasge is
+        relayed."""
+
+        substitute = args.substitute # Closure over args.substitute, capturing it for later use
+
+        def _routeMessage( self, msg, *args, **kwds ):
+            for pat,sub in self.substitute:
+                res = re.sub( pat, sub, msg )
+                if res != msg:
+                    self._logger.debug('Message transform {!r}'.format(res))
+                msg = res
+            super( RelaySubstitutions, self )._routeMessage( msg, *args, **kwds )
+
+    udp_relay = UdpRelay
+    tcp_relay = TcpRelay
+    if args.substitute:
+        for pat,sub in args.substitute:
+            logger.info( "substitutions: {!r} --> {!r}".format( pat, sub ))
+
+        class udp_relay( RelaySubstitutions, UdpRelay ):
+            pass
+
+        class tcp_relay( RelaySubstitutions, TcpRelay ):
+            pass
 
     ip_a = socket.gethostbyname(args.host_a)
     logger.info(
@@ -381,12 +447,12 @@ def main():
     relays = []
 
     for udp_port in args.udp_port:
-        relay = UdpRelay(ip_a, ip_b, udp_port, args.max_message_size)
+        relay = udp_relay(ip_a, ip_b, udp_port, args.max_message_size)
         relays.append(relay)
 
     for tcp_port in args.tcp_port:
         relay = TcpRelayServer(
-            ip_a, ip_b, tcp_port, args.max_message_size, args.backlog)
+            ip_a, ip_b, tcp_port, args.max_message_size, args.backlog, relay=tcp_relay)
         relays.append(relay)
 
     for relay in relays:
