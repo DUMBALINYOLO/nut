@@ -1,8 +1,10 @@
 #!/usr/bin/env python
 import argparse
+import errno
 import logging
 import select
 import socket
+import traceback
 import re
 from threading import Event, Thread
 
@@ -11,12 +13,48 @@ _global_kill = Event()
 
 
 class UdpRelay(Thread):
+    """Bind a new UDP socket to the given non-zero integer designated 'port' number, and receive
+    incoming datagrams from host_a.  For each datagram from a new incoming source port number
+    (eg. s1), create a new UDP socket bound to a fresh ephemeral port (eg. e1), and send the
+    datagram on to host_b at the designated 'port' number.
 
+                            .bind(('',port)) .bind(('',0)))
+                                             .connect((host_b,port))
+                            .recvfrom        .send
+        host_a,s1 ---(net)---> host,port >--- host,e1 ---(net)---> host_b,port
+        host_a,s2 --+                     +-- host,e2 --+
+        host_a,s3 --+                     +-- host,e3 --+
+              ...                                ...  
+        host_a,sN >-+                     +-> host,eN >-+
+
+    Later, for each response from host_b,port back to one of our host,eN ephemeral sockets, send it
+    out via the original host,port socket back to the original, corresponding host_a,sN address:
+
+                              .sendto         .recv
+        host_a,s1 ---(net)---< host,port <--- host,e1 ---(net)---< host_b,port
+        host_a,s2 --+                     +-- host,e2 --+
+        host_a,s3 --+                     +-- host,e3 --+
+              ...                                ...  
+        host_a,sN <-+                     +-< host,eN <-+
+
+    This UdpRelay class is used for all host,port and host,eN sockets; each binds and receives, and
+    sends via a separate UdpRelay's socket.
+
+    o One binds to a non-zero port number; if so
+      - Does NOT connect (receives) packets from any source
+      - Uses .send to transmit via its outgoing UdpRelay instance's socket
+      - Creates a UdpRelay for each new incoming source address,sN port
+    o Many bind to a zero (ephemeral) port; if so
+      - Connects to host_b,port, sending/receiving only to/from it
+      - Uses .sendto to transmit via its outgoing UdpRelay instance's socket
+
+    """
     def __init__(
             self,
             host_a, host_b, port,
             max_message_size=16384,
-            timeout=1.0):
+            timeout=1.0,
+            ephemeral=False ):
         super(UdpRelay, self).__init__()
 
         self.host_a = host_a
@@ -24,6 +62,8 @@ class UdpRelay(Thread):
         self.port = port
         self.max_message_size = max_message_size
         self.timeout = timeout
+        self.ephemeral = ephemeral # False, or the ((addr,port),UdpRelay()) tuple to send via
+        self.via = {} # If not ephemeral, contains target { (addr,port): UdpRelay(), ... }
 
         self._logger = logging.getLogger(
             'relay.UdpRelay({host_a} <-> {host_b}, {port})'
@@ -39,13 +79,18 @@ class UdpRelay(Thread):
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._logger.info('Successfully set socket option to SO_REUSEADDR')
 
-        self.socket.bind(('', self.port))
+        self.socket.bind(('', 0 if self.ephemeral else self.port))
+        self.bound = self.socket.getsockname() # eg. ('0.0.0.0',54149)
         self._logger.info(
-            'Successfully bound socket to ("", {port})'
-            .format(**self.__dict__))
+            'Successfully bound socket to  {0!r}'.format(self.bound))
+        if self.ephemeral:
+            self.socket.connect((self.host_b,self.port))
+            self._logger.info(
+                'Successfully connected socket {0!r} to {1!r}'
+                .format(self.bound, (self.host_b,self.port)))
 
     def __del__(self):
-        self._logger.info('Closing socket')
+        self._logger.info('Closing socket ({0!r}, {1!r})'.format(*self.bound))
         self.socket.close()
 
     def run(self):
@@ -57,25 +102,29 @@ class UdpRelay(Thread):
                 if _global_kill.isSet():
                     self._logger.info('Received global kill')
                     break
-
-                msg, (src_host, src_port) = \
-                    self.socket.recvfrom(self.max_message_size)
+                if self.ephemeral: # connected; we know the peer's source address.
+                    msg,(src_host,src_port) = \
+                        self.socket.recv(self.max_message_size),(self.host_b,self.port)
+                else:
+                    msg,(src_host,src_port) = \
+                        self.socket.recvfrom(self.max_message_size)
                 self._handleMessage(msg, src_host, src_port)
 
             except socket.timeout:
                 pass
 
-            except Exception as e:
+            except Exception as exc:
                 self._logger.error(
-                    'Caught exception while waiting for "recvfrom": {:}'
-                    .format(e))
+                    'Caught exception while waiting for "{!s}" on socket {!r}: {:}\n{!s}'
+                    .format("recv" if self.ephemeral else "recvfrom", self.bound, exc, traceback.format_exc()))
+                if hasattr( exc, 'errno' ) and exc.errno == errno.EISCONN:
+                    continue
                 break
 
         self._logger.info('Terminating')
 
     def _handleMessage(self, msg, src_host, src_port):
         self._logger.debug('Message received: {!r}'.format(msg))
-
         if src_host == self.host_a:
             src_name, dst_name = 'A', 'B'
             dst_host = self.host_b
@@ -88,19 +137,42 @@ class UdpRelay(Thread):
                 .format(src_host))
             return
 
-        self._routeMessage( msg, src_name, src_host, src_port,
-                                 dst_name, dst_host, self.port )
+        if self.ephemeral:
+            # Back via the original bound host,port socket, to the original address
+            addr,relay = self.ephemeral
+            relay._routeMessage( msg, src_name, src_host, src_port,
+                                      dst_name, addr[0], addr[1] )
+            dst_host,dst_port = addr[0],addr[1]
+        else:
+            # On to the target host_b,port, via a unique ephemeral socket for each src_host,src_port
+            addr = (src_host,src_port)
+            relay = self.via.get( addr )
+            if not relay:
+                self._logger.info('New source address ({0!r},{1!r})'.format(*addr))
+                relay = self.via[addr] = self.__class__(
+                    self.host_a, self.host_b, self.port,
+                    max_message_size=self.max_message_size, timeout=self.timeout,
+                    ephemeral=(addr,self))
+                relay.start()
+            dst_host,dst_port = self.host_b,self.port
+
+        relay._routeMessage( msg, src_name, src_host, src_port,
+                                  dst_name, dst_host, dst_port )
                             
     def _routeMessage( self, msg, src_name, src_host, src_port,
                                   dst_name, dst_host, dst_port ):
         self._logger.debug(
-            'Message received from host {:} ({!s}:{!s}), routing to host {:} '
-            '({!s}:{!s})'
+            'Message received from host {:} ({!s}:{!s})'
+            ', routing to host {:} ({!s}:{!s})'
+            ', via socket bound to ({!r},{!r})'
             .format(
                 src_name, src_host, src_port,
-                dst_name, dst_host, dst_port))
-
-        self.socket.sendto(msg, (dst_host, dst_port))
+                dst_name, dst_host, dst_port,
+                self.bound[0], self.bound[1] ))
+        if self.ephemeral:
+            self.socket.send(msg)
+        else:
+            self.socket.sendto(msg, (dst_host, dst_port))
 
 
 class TcpRelay(Thread):
@@ -458,14 +530,16 @@ def main():
     for relay in relays:
         relay.start()
 
-    try:
-        for relay in relays:
-            while relay.is_alive():
-                relay.join(timeout=10.0)
-    except (KeyboardInterrupt, SystemExit):
-        logger.info('Killing threads')
-        _global_kill.set()
-
+    # Await the completion of each Relay Thread, destroying (closing) each
+    while relays:
+        relay = relays.pop()
+        while relay.is_alive():
+            try:
+                relay.join(timeout=1.0)
+            except (KeyboardInterrupt, SystemExit) as exc:
+                logger.info('Killing threads: {!s}'.format( exc ))
+                _global_kill.set()
+        del relay
 
 if __name__ == '__main__':
     main()
